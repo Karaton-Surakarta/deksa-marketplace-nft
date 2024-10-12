@@ -18,6 +18,7 @@ interface NFTCardStrut {
   seller: string;
   owner: string;
   desc: string;
+  // onClick: () => void;
 }
 
 const nativeToken = "0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE";

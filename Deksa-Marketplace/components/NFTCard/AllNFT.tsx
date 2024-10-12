@@ -9,6 +9,13 @@ import axios from "axios";
 import { useSigner, useProvider } from "wagmi";
 import { RotatingLines } from "react-loader-spinner";
 
+interface NFTMetadata {
+  name?: string;
+  description?: string;
+  image?: string;
+  media?: Array<{ gateway: string }>;
+}
+
 interface NFTItem {
   listingId: number;
   price: string;
@@ -21,7 +28,15 @@ interface NFTItem {
   likes?: string;
 }
 
-const getImageUrl = (meta: any) => {
+interface RawListingData {
+  listingId: ethers.BigNumber | string | number;
+  tokenId: ethers.BigNumber;
+  pricePerToken?: ethers.BigNumber;
+  seller?: string;
+  owner?: string;
+}
+
+const getImageUrl = (meta: { data: NFTMetadata }): string => {
   if (meta.data?.image) {
     return meta.data.image.startsWith("ipfs://")
       ? `https://ipfs.io/ipfs/${meta.data.image.substring(7)}`
@@ -30,17 +45,46 @@ const getImageUrl = (meta: any) => {
   if (meta.data.media && meta.data.media.length > 0) {
     return meta.data.media[0].gateway;
   }
-  if (meta.data.image?.cachedUrl) {
-    return meta.data.image.cachedUrl;
-  }
   return "";
 };
 
-const processNFTData = async (data: any, tokenContract: any) => {
-  return await Promise.all(
-    data.map(async (d: any, index: number) => {
+const processListingId = (rawListingId: ethers.BigNumber | string | number): number => {
+  console.log('Processing raw listingId:', rawListingId);
+  
+  let processedListingId: number;
+  
+  if (ethers.BigNumber.isBigNumber(rawListingId)) {
+    processedListingId = rawListingId.toNumber();
+  } else if (typeof rawListingId === 'string') {
+    if (rawListingId.startsWith('0x')) {
+      processedListingId = parseInt(rawListingId.substring(2), 16);
+    } else {
+      processedListingId = parseInt(rawListingId, 10);
+    }
+  } else {
+    processedListingId = Number(rawListingId);
+  }
+  
+  console.log('Processed listingId:', processedListingId);
+  return processedListingId;
+};
+
+const processNFTData = async (
+  data: RawListingData[], 
+  tokenContract: ethers.Contract
+): Promise<NFTItem[]> => {
+  return (await Promise.all(
+    data.map(async (d: RawListingData, index: number) => {
       try {
-        const tokenId = d.tokenId || d[1];
+        const listingId = processListingId(d.listingId);
+        const tokenId = d.tokenId.toNumber();
+
+        console.log(`Processing NFT ${index}:`, {
+          listingId,
+          tokenId,
+          rawListingId: d.listingId
+        });
+
         const tokenUri = (await tokenContract.tokenURI(tokenId)).replace(
           "ipfs://",
           "https://ipfs.io/ipfs/"
@@ -48,31 +92,28 @@ const processNFTData = async (data: any, tokenContract: any) => {
         const meta = await axios.get(tokenUri);
 
         let price = "0";
-        const pricePerToken = d.pricePerToken || d[3];
-        if (pricePerToken && ethers.BigNumber.isBigNumber(pricePerToken)) {
-          price = ethers.utils.formatUnits(pricePerToken, "ether");
+        if (d.pricePerToken && ethers.BigNumber.isBigNumber(d.pricePerToken)) {
+          price = ethers.utils.formatUnits(d.pricePerToken, "ether");
         }
-
-        const listingId = parseInt(d.listingId, 16);
 
         const image = getImageUrl(meta);
 
         return {
           listingId,
           price,
-          tokenId: tokenId ? tokenId.toNumber() : 0,
-          seller: d[6] || "",
-          owner: d[7] || "",
+          tokenId,
+          seller: d.seller || "",
+          owner: d.owner || "",
           image,
-          title: meta.data.metadata?.name || `NFT ${index}`,
-          desc: meta.data.metadata?.description || "",
+          title: meta.data.name || `NFT ${index}`,
+          desc: meta.data.description || "",
         };
       } catch (itemError) {
         console.error(`Error processing item ${index}:`, itemError);
         return null;
       }
     })
-  );
+  )).filter((item): item is NFTItem => item !== null);
 };
 
 function AllNFT() {
@@ -80,22 +121,22 @@ function AllNFT() {
   const provider = useProvider();
   const [NFTData, setNFTData] = useState<NFTItem[] | null>(null);
   const [isLoading, setIsLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   // Pagination states
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 10; // Max 20 NFT per page
+  const itemsPerPage = 10;
 
-  // Get the current items based on currentPage and itemsPerPage
   const indexOfLastItem = currentPage * itemsPerPage;
   const indexOfFirstItem = indexOfLastItem - itemsPerPage;
   const currentItems = NFTData?.slice(indexOfFirstItem, indexOfLastItem);
-
-  // Calculate total pages
   const totalPages = NFTData ? Math.ceil(NFTData.length / itemsPerPage) : 1;
 
   const getItems = async () => {
     try {
       setIsLoading(true);
+      setError(null);
+
       const marketplaceContract = new ethers.Contract(
         process.env.NEXT_PUBLIC_MYNFT_ADDRESS || "",
         myNFTAbi,
@@ -110,11 +151,14 @@ function AllNFT() {
       const totalListings = await marketplaceContract.totalListings();
       const data = await marketplaceContract.getAllValidListings(0, totalListings.sub(1));
 
-      const newItems: NFTItem[] = await processNFTData(data, tokenContract);
-      const validItems = newItems.filter((item): item is NFTItem => item !== null);
-      setNFTData(validItems);
+      console.log('Raw data from contract:', data);
+
+      const processedData = await processNFTData(data, tokenContract);
+      setNFTData(processedData);
+
     } catch (error) {
       console.error("Error fetching NFT data:", error);
+      setError("Failed to fetch NFT data. Please ensure your wallet is connected and the contract is working correctly.");
       toast.error(
         "Terjadi kesalahan saat mengambil data NFT. Pastikan dompet Anda terhubung dan kontrak berfungsi dengan benar.",
         {
@@ -148,9 +192,17 @@ function AllNFT() {
     }
   };
 
+  const handleNFTSelection = (listingId: number) => {
+    console.log('Selected NFT with listingId:', listingId);
+    // Implement your NFT selection logic here
+  };
+
   return (
     <div className="container mx-auto px-4">
       <h1 className="text-white text-3xl font-bold mb-8">All NFT</h1>
+      
+      {error && <p className="text-red-500 text-center mb-4">{error}</p>}
+      
       {isLoading ? (
         <div className="flex justify-center items-center h-64">
           <RotatingLines
@@ -165,11 +217,14 @@ function AllNFT() {
         <>
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-8">
             {currentItems?.map((NFTCardData) => (
-              <NFTCard key={NFTCardData.tokenId} {...NFTCardData} />
+              <NFTCard 
+                key={`${NFTCardData.listingId}-${NFTCardData.tokenId}`}
+                {...NFTCardData}
+                // onClick={() => handleNFTSelection(NFTCardData.listingId)}
+              />
             ))}
           </div>
 
-          {/* Pagination Controls */}
           <div className="flex justify-center items-center mt-8">
             <button
               onClick={handlePreviousPage}
@@ -197,7 +252,8 @@ function AllNFT() {
       ) : (
         <p className="text-white text-center">No NFT Found.</p>
       )}
-      <ToastContainer />
+      
+      {/* <ToastContainer /> */}
     </div>
   );
 }
